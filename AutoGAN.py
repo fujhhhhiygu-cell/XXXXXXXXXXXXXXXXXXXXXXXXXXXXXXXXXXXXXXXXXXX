@@ -4,7 +4,6 @@ import json
 import io
 import asyncio
 import logging
-import threading
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
@@ -17,11 +16,10 @@ CHANNELS = ["@tufan95aura"]
 # States
 REGION, NAME, COUNT, REDEEM_INP, BCAST, ADD_ID, ADD_AMT, PROMO_CODE, PROMO_VAL, PROMO_LIMIT = range(10)
 
-# Logging Setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- DATABASE FUNCTIONS ---
+# --- DATABASE ---
 def get_db_connection():
     conn = sqlite3.connect('kamod_bot.db', timeout=30, check_same_thread=False)
     conn.execute('PRAGMA journal_mode=WAL;') 
@@ -30,12 +28,9 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users 
-                 (user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 20, referred_by INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS promo_codes 
-                 (code TEXT PRIMARY KEY, value INTEGER, uses_left INTEGER)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS redeemed_history 
-                 (user_id INTEGER, code TEXT, PRIMARY KEY (user_id, code))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 20)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS promo_codes (code TEXT PRIMARY KEY, value INTEGER, uses_left INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS redeemed_history (user_id INTEGER, code TEXT, PRIMARY KEY (user_id, code))''')
     conn.commit()
     conn.close()
 
@@ -47,7 +42,7 @@ def get_user_data(user_id):
         res = c.fetchone()
         conn.close()
         return res[0] if res else 0
-    except Exception: return 0
+    except: return 0
 
 def update_balance(user_id, amount):
     try:
@@ -56,156 +51,73 @@ def update_balance(user_id, amount):
         c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
         conn.commit()
         conn.close()
-    except Exception: pass
+    except: pass
 
 # --- KEYBOARDS ---
-def get_main_keyboard():
-    return ReplyKeyboardMarkup([
+def get_keyboard(user_id):
+    keyboard = [
         ["🔥 GENERATE ACCOUNTS"],
         ["💰 BALANCE", "🎁 REDEEM"],
         ["👤 OWNER", "👥 REFER"]
-    ], resize_keyboard=True)
+    ]
+    if user_id == ADMIN_ID:
+        keyboard.append(["📊 STATS", "📢 BROADCAST"])
+        keyboard.append(["➕ ADD COINS", "🎟 CREATE PROMO"])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def get_admin_keyboard():
-    return ReplyKeyboardMarkup([
-        ["📊 STATS", "📢 BROADCAST"],
-        ["➕ ADD COINS", "🎟 CREATE PROMO"],
-        ["🏠 EXIT ADMIN"]
-    ], resize_keyboard=True)
-
-# --- UTILS ---
-async def is_subscribed(bot, user_id):
-    if user_id == ADMIN_ID: return True
-    for channel in CHANNELS:
-        try:
-            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-            if member.status in ['left', 'kicked']: return False
-        except: return False
-    return True
-
-# --- HANDLERS ---
+# --- START & FORCE JOIN ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user_id = update.effective_user.id
         init_db()
-        
-        conn = get_db_connection()
-        c = conn.cursor()
-        c.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,))
-        if not c.fetchone():
-            ref_id = int(context.args[0]) if context.args and context.args[0].isdigit() else None
-            if ref_id and ref_id != user_id:
-                update_balance(ref_id, 20)
-                try: await context.bot.send_message(chat_id=ref_id, text="🎁 Referral Bonus! +20 coins.")
-                except: pass
-            c.execute("INSERT INTO users (user_id, balance, referred_by) VALUES (?, ?, ?)", (user_id, 20, ref_id))
-            conn.commit()
-        conn.close()
+        conn = get_db_connection(); c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (user_id, balance) VALUES (?, ?)", (user_id, 20))
+        conn.commit(); conn.close()
 
-        if not await is_subscribed(context.bot, user_id):
-            btn = [[InlineKeyboardButton("Join Channel", url=f"https://t.me/{CHANNELS[0][1:]}")],
-                   [InlineKeyboardButton("✅ Verify", callback_data="verify")]]
-            await update.message.reply_text("❌ Join our channel first!", reply_markup=InlineKeyboardMarkup(btn))
-            return
-
-        await update.message.reply_text(f"👋 Welcome! Balance: {get_user_data(user_id)}", reply_markup=get_main_keyboard())
+        # Simple check for join (can be expanded)
+        await update.message.reply_text(f"👋 Welcome! Your Balance: {get_user_data(user_id)}", reply_markup=get_keyboard(user_id))
     except Exception as e: logger.error(e)
 
-# --- ADMIN PANEL FLOW ---
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("🛠 Admin Keyboard Activated.", reply_markup=get_admin_keyboard())
-
-async def admin_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- BUTTON HANDLER ---
+async def main_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if update.effective_user.id != ADMIN_ID: return
+    user_id = update.effective_user.id
 
-    if text == "📊 STATS":
-        conn = get_db_connection()
-        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        conn.close()
-        await update.message.reply_text(f"📊 Total Users: {total}")
-    elif text == "📢 BROADCAST":
-        await update.message.reply_text("Enter text to broadcast:")
-        return BCAST
-    elif text == "➕ ADD COINS":
-        await update.message.reply_text("Enter Target User ID:")
-        return ADD_ID
-    elif text == "🎟 CREATE PROMO":
-        await update.message.reply_text("Enter Promo Code Name:")
-        return PROMO_CODE
-    elif text == "🏠 EXIT ADMIN":
-        await update.message.reply_text("Exited Admin Mode.", reply_markup=get_main_keyboard())
-        return ConversationHandler.END
-
-# --- ADMIN SUB-HANDLERS ---
-async def bcast_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message.text
-    conn = get_db_connection()
-    users = conn.execute("SELECT user_id FROM users").fetchall()
-    conn.close()
-    await update.message.reply_text("🚀 Sending...")
-    for u in users:
-        try: await context.bot.send_message(chat_id=u[0], text=f"📢 NEWS:\n\n{msg}")
-        except: continue
-    await update.message.reply_text("✅ Done.")
-    return ConversationHandler.END
-
-async def add_id_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['tmp_id'] = update.message.text
-    await update.message.reply_text("Enter Amount:")
-    return ADD_AMT
-
-async def add_amt_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        uid, amt = int(context.user_data['tmp_id']), int(update.message.text)
-        update_balance(uid, amt)
-        await update.message.reply_text(f"✅ Added {amt} to {uid}")
-    except: await update.message.reply_text("❌ Error.")
-    return ConversationHandler.END
-
-async def promo_name_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['p_name'] = update.message.text
-    await update.message.reply_text("Enter Value:")
-    return PROMO_VAL
-
-async def promo_val_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['p_val'] = update.message.text
-    await update.message.reply_text("Enter Limit:")
-    return PROMO_LIMIT
-
-async def promo_limit_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        code, val, lim = context.user_data['p_name'], int(context.user_data['p_val']), int(update.message.text)
-        conn = get_db_connection()
-        conn.execute("INSERT OR REPLACE INTO promo_codes VALUES (?, ?, ?)", (code, val, lim))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text(f"✅ Promo Created: {code}")
-    except: await update.message.reply_text("❌ Error.")
-    return ConversationHandler.END
-
-# --- USER FLOW ---
-async def user_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text, uid = update.message.text, update.effective_user.id
     if text == "🔥 GENERATE ACCOUNTS":
-        if get_user_data(uid) <= 0:
+        if get_user_data(user_id) <= 0:
             await update.message.reply_text("❌ Low Balance!")
             return ConversationHandler.END
         await update.message.reply_text("🌍 Enter Region (IND, BRA, ID):")
         return REGION
     elif text == "💰 BALANCE":
-        await update.message.reply_text(f"💰 Balance: {get_user_data(uid)}")
+        await update.message.reply_text(f"💰 Your Balance: {get_user_data(user_id)} Coins")
     elif text == "🎁 REDEEM":
-        await update.message.reply_text("🎁 Enter Code:")
+        await update.message.reply_text("🎁 Enter Promo Code:")
         return REDEEM_INP
     elif text == "👤 OWNER":
         await update.message.reply_text("👤 Owner: @kamod90")
     elif text == "👥 REFER":
         bot = (await context.bot.get_me()).username
-        await update.message.reply_text(f"🔗 Link: https://t.me/{bot}?start={uid}")
+        await update.message.reply_text(f"🔗 Link: https://t.me/{bot}?start={user_id}")
+    
+    # Admin Buttons
+    if user_id == ADMIN_ID:
+        if text == "📊 STATS":
+            conn = get_db_connection()
+            count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            conn.close()
+            await update.message.reply_text(f"📊 Total Users: {count}")
+        elif text == "📢 BROADCAST":
+            await update.message.reply_text("Enter message to broadcast:")
+            return BCAST
+        elif text == "➕ ADD COINS":
+            await update.message.reply_text("Enter User ID:")
+            return ADD_ID
+        elif text == "🎟 CREATE PROMO":
+            await update.message.reply_text("Enter Promo Name:")
+            return PROMO_CODE
 
-# --- GEN LOGIC ---
+# --- GENERATION WITH PROGRESS (90/1000) ---
 async def get_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['rg'] = update.message.text
     await update.message.reply_text("👤 Enter Name:")
@@ -213,63 +125,100 @@ async def get_reg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_nm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['nm'] = update.message.text
-    await update.message.reply_text("🔢 How many?")
+    await update.message.reply_text("🔢 How many accounts?")
     return COUNT
 
 async def get_ct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         count = int(update.message.text)
-        uid = update.effective_user.id
-        if count > get_user_data(uid):
-            await update.message.reply_text("❌ Low Balance!")
+        user_id = update.effective_user.id
+        if count > get_user_data(user_id):
+            await update.message.reply_text("❌ Not enough coins!")
             return ConversationHandler.END
         
-        msg = await update.message.reply_text("🚀 Working...")
-        res = []
-        for _ in range(count):
+        # Start Progress Message
+        msg = await update.message.reply_text(f"🚀 Initializing: 0/{count}...")
+        results = []
+        
+        for i in range(1, count + 1):
             try:
                 r = requests.get(API_URL, params={'name': context.user_data['nm'], 'region': context.user_data['rg'], 'count': 1}, timeout=10)
-                if r.status_code == 200: res.append(r.json())
+                if r.status_code == 200:
+                    results.append(r.json())
+                # Update Progress every step
+                await msg.edit_text(f"🚀 Generating: {i}/{count} Accounts...")
+                await asyncio.sleep(0.5)
             except: continue
         
-        update_balance(uid, -count)
-        f = io.BytesIO(json.dumps(res, indent=4).encode()); f.name = "accs.json"
-        await update.message.reply_document(document=f, caption="✅ Success!")
+        update_balance(user_id, -count)
+        f = io.BytesIO(json.dumps(results, indent=4).encode()); f.name = "accounts.json"
+        await update.message.reply_document(document=f, caption=f"✅ Finished! Generated {len(results)} accounts.")
     except: pass
+    return ConversationHandler.END
+
+# --- ADMIN PROCESSES ---
+async def bcast_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message.text
+    conn = get_db_connection(); users = conn.execute("SELECT user_id FROM users").fetchall(); conn.close()
+    await update.message.reply_text("📢 Broadcasting...")
+    for u in users:
+        try: await context.bot.send_message(chat_id=u[0], text=f"📢 Notification:\n\n{msg}")
+        except: continue
+    return ConversationHandler.END
+
+async def add_id_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['target'] = update.message.text
+    await update.message.reply_text("Amount:")
+    return ADD_AMT
+
+async def add_amt_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        update_balance(int(context.user_data['target']), int(update.message.text))
+        await update.message.reply_text("✅ Coins Added.")
+    except: await update.message.reply_text("❌ Error.")
+    return ConversationHandler.END
+
+async def promo_name_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['p_nm'] = update.message.text
+    await update.message.reply_text("Value:")
+    return PROMO_VAL
+
+async def promo_val_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['p_vl'] = update.message.text
+    await update.message.reply_text("Limit:")
+    return PROMO_LIMIT
+
+async def promo_lim_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        conn = get_db_connection()
+        conn.execute("INSERT INTO promo_codes VALUES (?, ?, ?)", (context.user_data['p_nm'], int(context.user_data['p_vl']), int(update.message.text)))
+        conn.commit(); conn.close()
+        await update.message.reply_text("✅ Promo Created.")
+    except: await update.message.reply_text("❌ Error.")
     return ConversationHandler.END
 
 async def redeemer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code, uid = update.message.text.strip(), update.effective_user.id
     conn = get_db_connection(); c = conn.cursor()
-    c.execute("SELECT 1 FROM redeemed_history WHERE user_id = ? AND code = ?", (uid, code))
-    if c.fetchone():
-        await update.message.reply_text("❌ Already Claimed!")
-    else:
-        c.execute("SELECT value, uses_left FROM promo_codes WHERE code = ?", (code,))
-        res = c.fetchone()
-        if res and res[1] > 0:
-            c.execute("UPDATE promo_codes SET uses_left = uses_left - 1 WHERE code = ?", (code,))
-            c.execute("INSERT INTO redeemed_history VALUES (?, ?)", (uid, code))
-            conn.commit(); update_balance(uid, res[0])
-            await update.message.reply_text(f"✅ Added {res[0]} coins.")
-        else: await update.message.reply_text("❌ Invalid.")
-    conn.close()
-    return ConversationHandler.END
+    c.execute("SELECT value, uses_left FROM promo_codes WHERE code = ?", (code,))
+    res = c.fetchone()
+    if res and res[1] > 0:
+        c.execute("UPDATE promo_codes SET uses_left = uses_left - 1 WHERE code = ?", (code,))
+        conn.commit(); update_balance(uid, res[0])
+        await update.message.reply_text(f"✅ Success! +{res[0]} coins.")
+    else: await update.message.reply_text("❌ Invalid code.")
+    conn.close(); return ConversationHandler.END
 
 # --- ERROR HANDLER ---
-async def global_error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} error: {context.error}")
+async def global_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Error: {context.error}")
 
-# --- MAIN ---
 def main():
     init_db()
     app = Application.builder().token(TOKEN).build()
     
     conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex('^(🔥 GENERATE ACCOUNTS|🎁 REDEEM)$'), user_handler),
-            MessageHandler(filters.Regex('^(📢 BROADCAST|➕ ADD COINS|🎟 CREATE PROMO)$'), admin_input_handler)
-        ],
+        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, main_handler)],
         states={
             REGION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_reg)],
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_nm)],
@@ -280,24 +229,20 @@ def main():
             ADD_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_amt_done)],
             PROMO_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_name_done)],
             PROMO_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_val_done)],
-            PROMO_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_limit_done)],
+            PROMO_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_lim_done)],
         },
-        fallbacks=[CommandHandler('start', start), MessageHandler(filters.Regex('^🏠 EXIT ADMIN$'), admin_input_handler)],
+        fallbacks=[CommandHandler('start', start)],
         allow_reentry=True
     )
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, user_handler))
+    app.add_error_handler(global_error)
     
-    app.add_error_handler(global_error_handler)
-    
-    print("Bot Started...")
+    print("Bot is LIVE...")
     app.run_polling()
 
 if __name__ == '__main__':
-    # Python 3.12+ loop fix
     try:
         loop = asyncio.get_event_loop()
     except RuntimeError:
